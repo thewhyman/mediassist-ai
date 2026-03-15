@@ -1,4 +1,5 @@
 import os
+import shutil
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -14,22 +15,24 @@ REPORTS_DIR.mkdir(exist_ok=True)
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://localhost:5432/medicaid")
 
-_NPX_ENV = {"NPM_CONFIG_LOGLEVEL": "silent", "NPM_CONFIG_FUND": "false", "NPM_CONFIG_AUDIT": "false"}
+# Resolve the actual path to globally-installed MCP server binaries.
+# This avoids npx, which pollutes stdout with install messages that
+# corrupt the MCP JSON-RPC stream.
+_pg_bin = shutil.which("mcp-server-postgres")
+_fs_bin = shutil.which("mcp-server-filesystem")
 
 SERVER_CONFIGS = {
     "postgres": StdioServerParameters(
-        command="npx",
-        args=["-y", "--loglevel=silent", "@modelcontextprotocol/server-postgres", DATABASE_URL],
-        env={**_NPX_ENV},
+        command=_pg_bin or "npx",
+        args=[DATABASE_URL] if _pg_bin else ["-y", "@modelcontextprotocol/server-postgres", DATABASE_URL],
     ),
     "fetch": StdioServerParameters(
         command="python",
         args=["-m", "mcp_server_fetch"],
     ),
     "filesystem": StdioServerParameters(
-        command="npx",
-        args=["-y", "--loglevel=silent", "@modelcontextprotocol/server-filesystem", str(REPORTS_DIR)],
-        env={**_NPX_ENV},
+        command=_fs_bin or "npx",
+        args=[str(REPORTS_DIR)] if _fs_bin else ["-y", "@modelcontextprotocol/server-filesystem", str(REPORTS_DIR)],
     ),
     "memory": StdioServerParameters(
         command="uvx",
