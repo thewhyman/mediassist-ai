@@ -5,11 +5,12 @@ and the FastAPI server.
 """
 
 import asyncio
+import json
 import logging
 from collections.abc import AsyncGenerator
 
-from anthropic import Anthropic
 from dotenv import load_dotenv
+from openai import OpenAI
 
 from mcp_manager import MCPManager
 from prompts import SYSTEM_PROMPT
@@ -18,10 +19,27 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
+MODEL = "gpt-4o"
+
+
+def _convert_tools(mcp_tools: list[dict]) -> list[dict]:
+    """Convert MCP tool dicts to OpenAI function-calling format."""
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": tool["name"],
+                "description": tool["description"],
+                "parameters": tool["input_schema"],
+            },
+        }
+        for tool in mcp_tools
+    ]
+
 
 class MedicaidAgent:
     def __init__(self):
-        self.anthropic = Anthropic()
+        self.client = OpenAI()
         self.mcp = MCPManager()
         self.conversations: dict[str, list] = {}  # session_id -> messages
 
@@ -35,8 +53,8 @@ class MedicaidAgent:
     async def process_query(self, query: str, session_id: str = "default") -> str:
         """Process a user query through the agentic loop.
 
-        Sends the query to Claude with all MCP tools available.
-        Loops until Claude stops requesting tool calls.
+        Sends the query to GPT-4o with all MCP tools available.
+        Loops until the model stops requesting tool calls.
         """
         if session_id not in self.conversations:
             self.conversations[session_id] = []
@@ -44,63 +62,55 @@ class MedicaidAgent:
         messages = self.conversations[session_id]
         messages.append({"role": "user", "content": query})
 
-        # Initial call to Claude
-        response = self.anthropic.messages.create(
-            model="claude-sonnet-4-20250514",
+        openai_tools = _convert_tools(self.mcp.tools)
+
+        response = self.client.chat.completions.create(
+            model=MODEL,
             max_tokens=4096,
-            system=SYSTEM_PROMPT,
-            messages=messages,
-            tools=self.mcp.tools,
+            messages=[{"role": "system", "content": SYSTEM_PROMPT}] + messages,
+            tools=openai_tools or None,
         )
 
-        # Agentic loop: keep going while Claude wants to use tools
-        while response.stop_reason == "tool_use":
-            assistant_content = response.content
-            messages.append({"role": "assistant", "content": assistant_content})
+        choice = response.choices[0]
+
+        # Agentic loop: keep going while the model wants to use tools
+        while choice.finish_reason == "tool_calls":
+            assistant_msg = choice.message
+            messages.append(assistant_msg.model_dump())
 
             # Process all tool calls in this response
-            tool_results = []
-            for block in assistant_content:
-                if block.type == "tool_use":
-                    logger.info("Tool call: %s(%s)", block.name, _truncate(str(block.input)))
-                    try:
-                        result = await self.mcp.call_tool(block.name, block.input)
-                        # Extract text from MCP result
-                        result_text = ""
-                        for content in result.content:
-                            if hasattr(content, "text"):
-                                result_text += content.text
-                        tool_results.append({
-                            "type": "tool_result",
-                            "tool_use_id": block.id,
-                            "content": result_text,
-                        })
-                    except Exception as e:
-                        tool_results.append({
-                            "type": "tool_result",
-                            "tool_use_id": block.id,
-                            "content": f"Error: {e}",
-                            "is_error": True,
-                        })
+            for tool_call in assistant_msg.tool_calls:
+                func_name = tool_call.function.name
+                func_args = json.loads(tool_call.function.arguments)
+                logger.info("Tool call: %s(%s)", func_name, _truncate(str(func_args)))
 
-            messages.append({"role": "user", "content": tool_results})
+                try:
+                    result = await self.mcp.call_tool(func_name, func_args)
+                    result_text = ""
+                    for content in result.content:
+                        if hasattr(content, "text"):
+                            result_text += content.text
+                except Exception as e:
+                    result_text = f"Error: {e}"
+
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": result_text,
+                })
 
             # Next iteration
-            response = self.anthropic.messages.create(
-                model="claude-sonnet-4-20250514",
+            response = self.client.chat.completions.create(
+                model=MODEL,
                 max_tokens=4096,
-                system=SYSTEM_PROMPT,
-                messages=messages,
-                tools=self.mcp.tools,
+                messages=[{"role": "system", "content": SYSTEM_PROMPT}] + messages,
+                tools=openai_tools or None,
             )
+            choice = response.choices[0]
 
         # Extract final text response
-        final_text = ""
-        for block in response.content:
-            if hasattr(block, "text"):
-                final_text += block.text
-
-        messages.append({"role": "assistant", "content": response.content})
+        final_text = choice.message.content or ""
+        messages.append({"role": "assistant", "content": final_text})
         return final_text
 
     async def process_query_stream(
@@ -113,51 +123,93 @@ class MedicaidAgent:
         messages = self.conversations[session_id]
         messages.append({"role": "user", "content": query})
 
+        openai_tools = _convert_tools(self.mcp.tools)
+
         while True:
-            collected_content = []
-            with self.anthropic.messages.stream(
-                model="claude-sonnet-4-20250514",
+            stream = self.client.chat.completions.create(
+                model=MODEL,
                 max_tokens=4096,
-                system=SYSTEM_PROMPT,
-                messages=messages,
-                tools=self.mcp.tools,
-            ) as stream:
-                for event in stream:
-                    if event.type == "content_block_delta":
-                        if hasattr(event.delta, "text"):
-                            yield event.delta.text
+                messages=[{"role": "system", "content": SYSTEM_PROMPT}] + messages,
+                tools=openai_tools or None,
+                stream=True,
+            )
 
-            response = stream.get_final_message()
-            collected_content = response.content
-            messages.append({"role": "assistant", "content": collected_content})
+            # Accumulate the full response from chunks
+            collected_content = ""
+            collected_tool_calls: dict[int, dict] = {}
+            finish_reason = None
 
-            if response.stop_reason != "tool_use":
+            for chunk in stream:
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
+                if chunk.choices[0].finish_reason:
+                    finish_reason = chunk.choices[0].finish_reason
+
+                # Stream text content
+                if delta and delta.content:
+                    collected_content += delta.content
+                    yield delta.content
+
+                # Accumulate tool calls (arrive incrementally)
+                if delta and delta.tool_calls:
+                    for tc_delta in delta.tool_calls:
+                        idx = tc_delta.index
+                        if idx not in collected_tool_calls:
+                            collected_tool_calls[idx] = {
+                                "id": "",
+                                "name": "",
+                                "arguments": "",
+                            }
+                        if tc_delta.id:
+                            collected_tool_calls[idx]["id"] = tc_delta.id
+                        if tc_delta.function:
+                            if tc_delta.function.name:
+                                collected_tool_calls[idx]["name"] = tc_delta.function.name
+                            if tc_delta.function.arguments:
+                                collected_tool_calls[idx]["arguments"] += tc_delta.function.arguments
+
+            # If no tool calls, we're done
+            if finish_reason != "tool_calls":
+                messages.append({"role": "assistant", "content": collected_content})
                 break
 
-            # Process tool calls
-            tool_results = []
-            for block in collected_content:
-                if block.type == "tool_use":
-                    try:
-                        result = await self.mcp.call_tool(block.name, block.input)
-                        result_text = ""
-                        for content in result.content:
-                            if hasattr(content, "text"):
-                                result_text += content.text
-                        tool_results.append({
-                            "type": "tool_result",
-                            "tool_use_id": block.id,
-                            "content": result_text,
-                        })
-                    except Exception as e:
-                        tool_results.append({
-                            "type": "tool_result",
-                            "tool_use_id": block.id,
-                            "content": f"Error: {e}",
-                            "is_error": True,
-                        })
+            # Store assistant message with tool calls
+            tool_calls_list = [
+                {
+                    "id": tc["id"],
+                    "type": "function",
+                    "function": {
+                        "name": tc["name"],
+                        "arguments": tc["arguments"],
+                    },
+                }
+                for _, tc in sorted(collected_tool_calls.items())
+            ]
+            messages.append({
+                "role": "assistant",
+                "content": collected_content or None,
+                "tool_calls": tool_calls_list,
+            })
 
-            messages.append({"role": "user", "content": tool_results})
+            # Execute tool calls
+            for tc in tool_calls_list:
+                func_name = tc["function"]["name"]
+                func_args = json.loads(tc["function"]["arguments"])
+                try:
+                    result = await self.mcp.call_tool(func_name, func_args)
+                    result_text = ""
+                    for content in result.content:
+                        if hasattr(content, "text"):
+                            result_text += content.text
+                except Exception as e:
+                    result_text = f"Error: {e}"
+
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc["id"],
+                    "content": result_text,
+                })
 
     async def cleanup(self):
         """Shut down all MCP connections."""

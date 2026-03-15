@@ -96,13 +96,14 @@ class MCPManager:
 
             try:
                 return await session.call_tool(tool_name, arguments)
-            except Exception:
+            except Exception as e:
                 if attempt < MAX_RETRIES:
                     logger.warning(
-                        "Tool call '%s' failed (attempt %d/%d), reconnecting...",
+                        "Tool call '%s' failed (attempt %d/%d): %s — reconnecting...",
                         tool_name,
                         attempt,
                         MAX_RETRIES,
+                        e,
                     )
                     self.sessions.pop(session_name, None)
                 else:

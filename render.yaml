@@ -1,0 +1,20 @@
+databases:
+  - name: medicaid-db
+    plan: free
+    databaseName: medicaid
+
+services:
+  - type: web
+    name: medicaid-eligibility-checker
+    runtime: python
+    buildCommand: pip install -r requirements.txt && npm install -g @modelcontextprotocol/server-postgres @modelcontextprotocol/server-filesystem && python seed_db.py
+    startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: DATABASE_URL
+        fromDatabase:
+          name: medicaid-db
+          property: connectionURI
+      - key: PYTHON_VERSION
+        value: "3.13"

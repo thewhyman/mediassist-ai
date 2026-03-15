@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FQHC Eligibility Copilot</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; height: 100vh; display: flex; flex-direction: column; background: #f5f7fa; color: #1a1a2e; }
+
+  /* Header */
+  .header { background: #1a73e8; color: #fff; padding: 12px 24px; display: flex; align-items: center; gap: 16px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+  .header h1 { font-size: 18px; font-weight: 600; }
+  .header .status { margin-left: auto; font-size: 12px; display: flex; align-items: center; gap: 6px; }
+  .header .status .dot { width: 8px; height: 8px; border-radius: 50%; background: #4caf50; }
+  .header .status .dot.offline { background: #f44336; }
+
+  /* Main layout */
+  .main { display: flex; flex: 1; overflow: hidden; }
+
+  /* Left sidebar — patients */
+  .sidebar-left { width: 280px; background: #fff; border-right: 1px solid #e0e0e0; display: flex; flex-direction: column; }
+  .sidebar-left .section-header { padding: 16px; font-size: 14px; font-weight: 600; color: #5f6368; text-transform: uppercase; letter-spacing: 0.5px; border-bottom: 1px solid #e0e0e0; display: flex; align-items: center; justify-content: space-between; }
+  .sidebar-left .section-header button { background: #1a73e8; color: #fff; border: none; border-radius: 4px; padding: 4px 12px; font-size: 12px; cursor: pointer; }
+  .sidebar-left .section-header button:hover { background: #1557b0; }
+  .patient-list { flex: 1; overflow-y: auto; padding: 8px; }
+  .patient-card { padding: 12px; border-radius: 8px; cursor: pointer; margin-bottom: 4px; transition: background 0.15s; }
+  .patient-card:hover { background: #f0f4ff; }
+  .patient-card.selected { background: #e3edff; border-left: 3px solid #1a73e8; }
+  .patient-card .name { font-weight: 600; font-size: 14px; }
+  .patient-card .details { font-size: 12px; color: #5f6368; margin-top: 4px; }
+  .patient-card .details span { margin-right: 8px; }
+
+  /* Center — chat */
+  .center { flex: 1; display: flex; flex-direction: column; background: #fafbfc; }
+  .chat-header { padding: 16px 24px; border-bottom: 1px solid #e0e0e0; background: #fff; display: flex; align-items: center; gap: 12px; }
+  .chat-header h2 { font-size: 16px; font-weight: 600; }
+  .chat-header .check-btn { margin-left: auto; background: #1a73e8; color: #fff; border: none; border-radius: 6px; padding: 8px 20px; font-size: 14px; cursor: pointer; font-weight: 500; }
+  .chat-header .check-btn:hover { background: #1557b0; }
+  .chat-header .check-btn:disabled { background: #94b8e8; cursor: not-allowed; }
+  .chat-messages { flex: 1; overflow-y: auto; padding: 24px; display: flex; flex-direction: column; gap: 16px; }
+  .chat-messages .empty { color: #9aa0a6; text-align: center; margin-top: 40%; font-size: 15px; }
+  .msg { max-width: 80%; padding: 12px 16px; border-radius: 12px; font-size: 14px; line-height: 1.6; }
+  .msg.user { align-self: flex-end; background: #1a73e8; color: #fff; border-bottom-right-radius: 4px; }
+  .msg.agent { align-self: flex-start; background: #fff; border: 1px solid #e0e0e0; border-bottom-left-radius: 4px; }
+  .msg.agent h1, .msg.agent h2, .msg.agent h3 { font-size: 14px; font-weight: 700; margin: 8px 0 4px; }
+  .msg.agent strong { font-weight: 700; }
+  .msg.agent table { border-collapse: collapse; margin: 8px 0; font-size: 13px; }
+  .msg.agent th, .msg.agent td { border: 1px solid #ddd; padding: 4px 8px; text-align: left; }
+  .msg.agent th { background: #f5f5f5; }
+  .msg.agent ul, .msg.agent ol { padding-left: 20px; margin: 4px 0; }
+  .msg .typing { display: inline-block; }
+  .msg .cursor { display: inline-block; width: 2px; height: 14px; background: #1a73e8; animation: blink 0.8s infinite; vertical-align: text-bottom; margin-left: 1px; }
+  @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
+  .chat-input { padding: 16px 24px; border-top: 1px solid #e0e0e0; background: #fff; display: flex; gap: 8px; }
+  .chat-input input { flex: 1; border: 1px solid #ddd; border-radius: 8px; padding: 10px 16px; font-size: 14px; outline: none; }
+  .chat-input input:focus { border-color: #1a73e8; }
+  .chat-input button { background: #1a73e8; color: #fff; border: none; border-radius: 8px; padding: 10px 20px; cursor: pointer; font-size: 14px; }
+  .chat-input button:hover { background: #1557b0; }
+
+  /* Right sidebar — reports */
+  .sidebar-right { width: 300px; background: #fff; border-left: 1px solid #e0e0e0; display: flex; flex-direction: column; }
+  .sidebar-right .section-header { padding: 16px; font-size: 14px; font-weight: 600; color: #5f6368; text-transform: uppercase; letter-spacing: 0.5px; border-bottom: 1px solid #e0e0e0; }
+  .report-list { padding: 8px; overflow-y: auto; }
+  .report-item { padding: 10px 12px; border-radius: 6px; cursor: pointer; font-size: 13px; color: #1a73e8; margin-bottom: 2px; }
+  .report-item:hover { background: #f0f4ff; }
+  .report-item.selected { background: #e3edff; font-weight: 600; }
+  .report-view { flex: 1; overflow-y: auto; padding: 16px; font-size: 13px; line-height: 1.6; }
+  .report-view .placeholder { color: #9aa0a6; text-align: center; margin-top: 40px; }
+  .report-view h1, .report-view h2, .report-view h3 { font-size: 14px; font-weight: 700; margin: 12px 0 4px; }
+  .report-view table { border-collapse: collapse; margin: 8px 0; font-size: 12px; }
+  .report-view th, .report-view td { border: 1px solid #ddd; padding: 4px 8px; }
+  .report-view th { background: #f5f5f5; }
+
+  /* Modal */
+  .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.4); z-index: 100; align-items: center; justify-content: center; }
+  .modal-overlay.active { display: flex; }
+  .modal { background: #fff; border-radius: 12px; padding: 24px; width: 420px; max-height: 80vh; overflow-y: auto; box-shadow: 0 8px 32px rgba(0,0,0,0.2); }
+  .modal h3 { margin-bottom: 16px; }
+  .modal label { display: block; font-size: 13px; font-weight: 500; margin-bottom: 4px; margin-top: 12px; color: #5f6368; }
+  .modal input, .modal select { width: 100%; border: 1px solid #ddd; border-radius: 6px; padding: 8px 12px; font-size: 14px; }
+  .modal .row { display: flex; gap: 12px; }
+  .modal .row > div { flex: 1; }
+  .modal .actions { margin-top: 20px; display: flex; gap: 8px; justify-content: flex-end; }
+  .modal .actions button { padding: 8px 20px; border-radius: 6px; font-size: 14px; cursor: pointer; }
+  .modal .btn-cancel { background: #f5f5f5; border: 1px solid #ddd; color: #333; }
+  .modal .btn-save { background: #1a73e8; border: none; color: #fff; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
+  <h1>FQHC Eligibility Copilot</h1>
+  <div class="status">
+    <div class="dot" id="statusDot"></div>
+    <span id="statusText">Connecting...</span>
+  </div>
+</div>
+
+<div class="main">
+  <!-- Left sidebar: Patients -->
+  <div class="sidebar-left">
+    <div class="section-header">
+      Patients
+      <button onclick="openAddPatient()">+ Add</button>
+    </div>
+    <div class="patient-list" id="patientList"></div>
+  </div>
+
+  <!-- Center: Chat -->
+  <div class="center">
+    <div class="chat-header">
+      <h2 id="chatTitle">Select a patient</h2>
+      <button class="check-btn" id="checkBtn" onclick="checkEligibility()" disabled>Check Eligibility</button>
+    </div>
+    <div class="chat-messages" id="chatMessages">
+      <div class="empty">Select a patient from the left panel to begin an eligibility check.</div>
+    </div>
+    <div class="chat-input">
+      <input type="text" id="chatInput" placeholder="Ask a follow-up question..." onkeydown="if(event.key==='Enter')sendMessage()" disabled>
+      <button onclick="sendMessage()" id="sendBtn" disabled>Send</button>
+    </div>
+  </div>
+
+  <!-- Right sidebar: Reports -->
+  <div class="sidebar-right">
+    <div class="section-header">Reports</div>
+    <div class="report-list" id="reportList"></div>
+    <div class="report-view" id="reportView">
+      <div class="placeholder">Select a report to view</div>
+    </div>
+  </div>
+</div>
+
+<!-- Add Patient Modal -->
+<div class="modal-overlay" id="addPatientModal">
+  <div class="modal">
+    <h3>Add New Patient</h3>
+    <div class="row">
+      <div><label>First Name</label><input id="pFirstName"></div>
+      <div><label>Last Name</label><input id="pLastName"></div>
+    </div>
+    <div class="row">
+      <div><label>Date of Birth</label><input id="pDob" type="date"></div>
+      <div><label>Age</label><input id="pAge" type="number"></div>
+    </div>
+    <div class="row">
+      <div><label>State</label><input id="pState" maxlength="2" placeholder="e.g. CA"></div>
+      <div><label>County</label><input id="pCounty"></div>
+    </div>
+    <div class="row">
+      <div><label>Household Size</label><input id="pHousehold" type="number" value="1"></div>
+      <div><label>Annual Income</label><input id="pIncome" type="number" placeholder="e.g. 25000"></div>
+    </div>
+    <label>Income Source</label>
+    <input id="pIncomeSource" placeholder="e.g. employment">
+    <div class="row">
+      <div><label>Pregnant</label><select id="pPregnant"><option value="false">No</option><option value="true">Yes</option></select></div>
+      <div><label>Disability</label><select id="pDisability"><option value="false">No</option><option value="true">Yes</option></select></div>
+    </div>
+    <div class="row">
+      <div><label>US Citizen</label><select id="pCitizen"><option value="true">Yes</option><option value="false">No</option></select></div>
+      <div><label>Current Insurance</label><input id="pInsurance" placeholder="e.g. none"></div>
+    </div>
+    <div class="actions">
+      <button class="btn-cancel" onclick="closeAddPatient()">Cancel</button>
+      <button class="btn-save" onclick="savePatient()">Save</button>
+    </div>
+  </div>
+</div>
+
+<script>
+let selectedPatient = null;
+let sessionId = null;
+let isStreaming = false;
+
+// --- Markdown renderer ---
+function renderMd(text) {
+  // Strip LaTeX math notation GPT-4o sometimes emits
+  let s = text
+    .replace(/\\\[(.+?)\\\]/gs, '<code>$1</code>')
+    .replace(/\\\((.+?)\\\)/gs, '<code>$1</code>');
+  // Escape HTML
+  s = s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  // Headers
+  s = s.replace(/^### (.+)$/gm, '<h3>$1</h3>');
+  s = s.replace(/^## (.+)$/gm, '<h2>$1</h2>');
+  s = s.replace(/^# (.+)$/gm, '<h1>$1</h1>');
+  // Bold and italic (allow multiline spans)
+  s = s.replace(/\*\*(.+?)\*\*/gs, '<strong>$1</strong>');
+  s = s.replace(/\*(.+?)\*/gs, '<em>$1</em>');
+  // Inline code
+  s = s.replace(/`(.+?)`/gs, '<code>$1</code>');
+  // Horizontal rule
+  s = s.replace(/^---+$/gm, '<hr>');
+  // Tables — collect consecutive | lines
+  s = s.replace(/((?:^\|.+\|$\n?)+)/gm, function(table) {
+    const rows = table.trim().split('\n').filter(r => !r.match(/^\|[\s\-:|]+\|$/));
+    if (rows.length === 0) return table;
+    let t = '<table>';
+    rows.forEach((row, i) => {
+      const cells = row.split('|').filter(c => c.trim() !== '');
+      const tag = i === 0 ? 'th' : 'td';
+      t += '<tr>' + cells.map(c => `<${tag}>${c.trim()}</${tag}>`).join('') + '</tr>';
+    });
+    return t + '</table>';
+  });
+  // Lists — unordered
+  s = s.replace(/^[ ]*- (.+)$/gm, '<li>$1</li>');
+  // Lists — ordered
+  s = s.replace(/^[ ]*\d+\. (.+)$/gm, '<li>$1</li>');
+  // Wrap consecutive <li> in <ul>
+  s = s.replace(/((?:<li>.+?<\/li>\s*)+)/gs, '<ul>$1</ul>');
+  // Paragraphs
+  s = s.replace(/\n\n+/g, '<br><br>');
+  s = s.replace(/\n/g, '<br>');
+  return s;
+}
+
+// --- Health check ---
+async function checkHealth() {
+  try {
+    const r = await fetch('/health');
+    const data = await r.json();
+    document.getElementById('statusDot').className = 'dot';
+    document.getElementById('statusText').textContent = data.mcp_servers.join(', ');
+  } catch {
+    document.getElementById('statusDot').className = 'dot offline';
+    document.getElementById('statusText').textContent = 'Disconnected';
+  }
+}
+
+// --- Patients ---
+async function loadPatients() {
+  const r = await fetch('/patients');
+  const data = await r.json();
+  const list = document.getElementById('patientList');
+  list.innerHTML = '';
+  data.patients.forEach(p => {
+    const card = document.createElement('div');
+    card.className = 'patient-card' + (selectedPatient && selectedPatient.id === p.id ? ' selected' : '');
+    card.innerHTML = `
+      <div class="name">${p.first_name} ${p.last_name}</div>
+      <div class="details">
+        <span>Age ${p.age}</span>
+        <span>${p.state}</span>
+        <span>$${Number(p.annual_income).toLocaleString()}</span>
+      </div>`;
+    card.onclick = () => selectPatient(p);
+    list.appendChild(card);
+  });
+}
+
+function selectPatient(p) {
+  selectedPatient = p;
+  sessionId = 'patient-' + p.id + '-' + Date.now();
+  document.getElementById('chatTitle').textContent = `${p.first_name} ${p.last_name} — ${p.state}`;
+  document.getElementById('checkBtn').disabled = false;
+  document.getElementById('chatInput').disabled = false;
+  document.getElementById('sendBtn').disabled = false;
+  document.getElementById('chatMessages').innerHTML = '';
+  loadPatients(); // refresh selection highlight
+}
+
+// --- Chat ---
+function addMessage(role, content) {
+  const area = document.getElementById('chatMessages');
+  const div = document.createElement('div');
+  div.className = 'msg ' + role;
+  if (role === 'agent') {
+    div.innerHTML = renderMd(content);
+  } else {
+    div.textContent = content;
+  }
+  area.appendChild(div);
+  area.scrollTop = area.scrollHeight;
+  return div;
+}
+
+function createStreamingBubble() {
+  const area = document.getElementById('chatMessages');
+  const div = document.createElement('div');
+  div.className = 'msg agent';
+  div.innerHTML = '<span class="typing"></span><span class="cursor"></span>';
+  area.appendChild(div);
+  area.scrollTop = area.scrollHeight;
+  return div;
+}
+
+async function streamResponse(query) {
+  if (isStreaming) return;
+  isStreaming = true;
+  setInputState(false);
+
+  addMessage('user', query);
+  const bubble = createStreamingBubble();
+  let fullText = '';
+
+  try {
+    const r = await fetch('/check/stream', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query, session_id: sessionId }),
+    });
+
+    const reader = r.body.getReader();
+    const decoder = new TextDecoder();
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunk = decoder.decode(value, { stream: true });
+      fullText += chunk;
+      // Live-render markdown as it streams in
+      bubble.innerHTML = renderMd(fullText) + '<span class="cursor"></span>';
+      const area = document.getElementById('chatMessages');
+      area.scrollTop = area.scrollHeight;
+    }
+  } catch (e) {
+    fullText += '\n\n[Error: connection lost]';
+  }
+
+  // Final render without cursor
+  bubble.innerHTML = renderMd(fullText);
+  isStreaming = false;
+  setInputState(true);
+  loadReports(); // refresh in case a new report was saved
+}
+
+function setInputState(enabled) {
+  document.getElementById('chatInput').disabled = !enabled;
+  document.getElementById('sendBtn').disabled = !enabled;
+  document.getElementById('checkBtn').disabled = !enabled || !selectedPatient;
+}
+
+function checkEligibility() {
+  if (!selectedPatient) return;
+  streamResponse(`Check Medicaid eligibility for patient ID ${selectedPatient.id}`);
+}
+
+function sendMessage() {
+  const input = document.getElementById('chatInput');
+  const text = input.value.trim();
+  if (!text || isStreaming) return;
+  input.value = '';
+  streamResponse(text);
+}
+
+// --- Reports ---
+async function loadReports() {
+  try {
+    const r = await fetch('/reports');
+    const data = await r.json();
+    const list = document.getElementById('reportList');
+    list.innerHTML = '';
+    if (data.reports.length === 0) {
+      list.innerHTML = '<div style="padding:12px;color:#9aa0a6;font-size:13px;">No reports yet</div>';
+      return;
+    }
+    data.reports.forEach(name => {
+      const div = document.createElement('div');
+      div.className = 'report-item';
+      div.textContent = name;
+      div.onclick = () => viewReport(name, div);
+      list.appendChild(div);
+    });
+  } catch {}
+}
+
+async function viewReport(filename, el) {
+  document.querySelectorAll('.report-item').forEach(e => e.classList.remove('selected'));
+  el.classList.add('selected');
+  const r = await fetch(`/reports/${filename}`);
+  const data = await r.json();
+  document.getElementById('reportView').innerHTML = renderMd(data.content);
+}
+
+// --- Add Patient Modal ---
+function openAddPatient() {
+  document.getElementById('addPatientModal').classList.add('active');
+}
+
+function closeAddPatient() {
+  document.getElementById('addPatientModal').classList.remove('active');
+}
+
+async function savePatient() {
+  const body = {
+    first_name: document.getElementById('pFirstName').value,
+    last_name: document.getElementById('pLastName').value,
+    date_of_birth: document.getElementById('pDob').value,
+    age: parseInt(document.getElementById('pAge').value),
+    state: document.getElementById('pState').value.toUpperCase(),
+    county: document.getElementById('pCounty').value || null,
+    household_size: parseInt(document.getElementById('pHousehold').value),
+    annual_income: parseFloat(document.getElementById('pIncome').value),
+    income_source: document.getElementById('pIncomeSource').value || null,
+    is_pregnant: document.getElementById('pPregnant').value === 'true',
+    has_disability: document.getElementById('pDisability').value === 'true',
+    is_us_citizen: document.getElementById('pCitizen').value === 'true',
+    current_insurance: document.getElementById('pInsurance').value || null,
+  };
+  await fetch('/patients', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  closeAddPatient();
+  loadPatients();
+}
+
+// --- Init ---
+checkHealth();
+loadPatients();
+loadReports();
+setInterval(checkHealth, 30000);
+</script>
+</body>
+</html>

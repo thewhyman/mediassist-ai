@@ -1,16 +1,18 @@
 """FastAPI web server wrapping the Medicaid Eligibility Agent."""
 
 import logging
-import sqlite3
+import os
 from contextlib import asynccontextmanager
-from pathlib import Path
 
+import psycopg2
+import psycopg2.extras
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from agent import MedicaidAgent
-from config import DB_PATH, REPORTS_DIR
+from config import REPORTS_DIR
 
 logging.basicConfig(
     level=logging.INFO,
@@ -18,7 +20,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://localhost:5432/medicaid")
+
 agent = MedicaidAgent()
+
+
+def get_db():
+    conn = psycopg2.connect(DATABASE_URL)
+    conn.autocommit = False
+    return conn
 
 
 @asynccontextmanager
@@ -34,6 +44,15 @@ app = FastAPI(
     description="AI agent that determines Medicaid eligibility using MCP servers",
     lifespan=lifespan,
 )
+
+
+@app.get("/")
+async def root():
+    """Serve the FQHC Copilot UI."""
+    return FileResponse("static/index.html")
+
+
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
 class CheckRequest(BaseModel):
@@ -53,11 +72,12 @@ async def health():
 
 @app.get("/patients")
 async def list_patients():
-    """List all patients from the SQLite database."""
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.row_factory = sqlite3.Row
+    """List all patients from the PostgreSQL database."""
+    conn = get_db()
     try:
-        rows = conn.execute("SELECT * FROM patients").fetchall()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT * FROM patients")
+            rows = cur.fetchall()
         return {"patients": [dict(row) for row in rows]}
     finally:
         conn.close()
@@ -83,34 +103,37 @@ class PatientCreate(BaseModel):
 @app.post("/patients", status_code=201)
 async def create_patient(patient: PatientCreate):
     """Add a new patient to the database."""
-    conn = sqlite3.connect(str(DB_PATH))
+    conn = get_db()
     try:
-        cursor = conn.execute(
-            """INSERT INTO patients (
-                first_name, last_name, date_of_birth, age, state, county,
-                household_size, annual_income, income_source,
-                is_pregnant, has_disability, is_us_citizen,
-                immigration_status, current_insurance
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                patient.first_name,
-                patient.last_name,
-                patient.date_of_birth,
-                patient.age,
-                patient.state,
-                patient.county,
-                patient.household_size,
-                patient.annual_income,
-                patient.income_source,
-                int(patient.is_pregnant),
-                int(patient.has_disability),
-                int(patient.is_us_citizen),
-                patient.immigration_status,
-                patient.current_insurance,
-            ),
-        )
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO patients (
+                    first_name, last_name, date_of_birth, age, state, county,
+                    household_size, annual_income, income_source,
+                    is_pregnant, has_disability, is_us_citizen,
+                    immigration_status, current_insurance
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id""",
+                (
+                    patient.first_name,
+                    patient.last_name,
+                    patient.date_of_birth,
+                    patient.age,
+                    patient.state,
+                    patient.county,
+                    patient.household_size,
+                    patient.annual_income,
+                    patient.income_source,
+                    patient.is_pregnant,
+                    patient.has_disability,
+                    patient.is_us_citizen,
+                    patient.immigration_status,
+                    patient.current_insurance,
+                ),
+            )
+            new_id = cur.fetchone()[0]
         conn.commit()
-        return {"id": cursor.lastrowid, **patient.model_dump()}
+        return {"id": new_id, **patient.model_dump()}
     finally:
         conn.close()
 
@@ -118,12 +141,11 @@ async def create_patient(patient: PatientCreate):
 @app.get("/patients/{patient_id}")
 async def get_patient(patient_id: int):
     """Get a specific patient by ID."""
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.row_factory = sqlite3.Row
+    conn = get_db()
     try:
-        row = conn.execute(
-            "SELECT * FROM patients WHERE id = ?", (patient_id,)
-        ).fetchone()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT * FROM patients WHERE id = %s", (patient_id,))
+            row = cur.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Patient not found")
         return dict(row)
@@ -158,12 +180,11 @@ async def check_eligibility_stream(request: CheckRequest):
 @app.post("/check/{patient_id}", response_model=CheckResponse)
 async def check_patient_by_id(patient_id: int, session_id: str = "default"):
     """Run an eligibility check for a specific patient by ID."""
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.row_factory = sqlite3.Row
+    conn = get_db()
     try:
-        row = conn.execute(
-            "SELECT * FROM patients WHERE id = ?", (patient_id,)
-        ).fetchone()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT * FROM patients WHERE id = %s", (patient_id,))
+            row = cur.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Patient not found")
     finally:
@@ -181,7 +202,6 @@ async def get_session(session_id: str):
     if messages is None:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    # Serialize messages — content blocks may be Anthropic objects
     history = []
     for msg in messages:
         role = msg["role"]
@@ -223,7 +243,7 @@ async def list_reports():
 @app.get("/reports/{filename}")
 async def get_report(filename: str):
     """Get a specific determination report."""
-    # Prevent path traversal
+    from pathlib import Path
     safe_name = Path(filename).name
     report_path = REPORTS_DIR / safe_name
     if not report_path.exists() or not report_path.suffix == ".md":

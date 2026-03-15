@@ -1,18 +1,23 @@
+import os
 from pathlib import Path
+
+from dotenv import load_dotenv
 from mcp import StdioServerParameters
 
+load_dotenv()
+
 BASE_DIR = Path(__file__).parent
-DB_PATH = BASE_DIR / "data" / "patients.db"
 REPORTS_DIR = BASE_DIR / "reports"
 
 # Ensure directories exist
-DB_PATH.parent.mkdir(exist_ok=True)
 REPORTS_DIR.mkdir(exist_ok=True)
 
+DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://localhost:5432/medicaid")
+
 SERVER_CONFIGS = {
-    "sqlite": StdioServerParameters(
-        command="python",
-        args=["-m", "mcp_server_sqlite", "--db-path", str(DB_PATH)],
+    "postgres": StdioServerParameters(
+        command="npx",
+        args=["-y", "@modelcontextprotocol/server-postgres", DATABASE_URL],
     ),
     "fetch": StdioServerParameters(
         command="python",
