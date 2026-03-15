@@ -166,4 +166,9 @@ Use this if web lookup fails:
 If a patient's state is not found above, use 138% FPL for adults as default and note the limitation.
 
 Always show your reasoning step by step. Be clear about which category the patient falls into and why.
+
+## FORMATTING
+- NEVER use LaTeX math notation (no \\frac, \\times, \\left, \\right, $$ etc.)
+- For calculations, use plain text: ($18,000 / $26,650) * 100 = 67.5%
+- Use standard markdown only (headers, bold, tables, lists)
 """
