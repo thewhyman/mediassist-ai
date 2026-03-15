@@ -8,6 +8,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from collections.abc import AsyncGenerator
 
 from dotenv import load_dotenv
@@ -26,6 +27,8 @@ _mem0_api_key = os.environ.get("MEM0_API_KEY", "")
 mem0 = MemoryClient(api_key=_mem0_api_key) if _mem0_api_key else None
 
 MODEL = "gpt-4o-mini"
+MAX_AGENT_ITERATIONS = 10
+MAX_TOOL_RESULT_LENGTH = 10000
 
 
 def _convert_tools(mcp_tools: list[dict]) -> list[dict]:
@@ -165,6 +168,17 @@ class MedicaidAgent:
             saved = self.load_conversation(session_id)
             self.conversations[session_id] = saved if saved else []
 
+    @staticmethod
+    def _sanitize_tool_result(result_text: str) -> str:
+        """Truncate oversized tool results and strip control characters."""
+        if len(result_text) > MAX_TOOL_RESULT_LENGTH:
+            result_text = result_text[:MAX_TOOL_RESULT_LENGTH] + "\n...[truncated]"
+        # Strip null bytes and other control chars (except newline/tab)
+        result_text = "".join(
+            ch for ch in result_text if ch in ("\n", "\t") or (ch >= " ")
+        )
+        return result_text
+
     async def process_query(self, query: str, session_id: str = "default") -> str:
         """Process a user query through the agentic loop.
 
@@ -196,7 +210,11 @@ class MedicaidAgent:
         openai_tools = _convert_tools(self.mcp.tools)
 
         api_calls = 1
+        total_input_tokens = 0
+        total_output_tokens = 0
         tool_names_used = []
+        start_time = time.monotonic()
+
         response = self.client.chat.completions.create(
             model=MODEL,
             max_tokens=4096,
@@ -205,9 +223,19 @@ class MedicaidAgent:
         )
 
         choice = response.choices[0]
+        if response.usage:
+            total_input_tokens += response.usage.prompt_tokens
+            total_output_tokens += response.usage.completion_tokens
 
         # Agentic loop: keep going while the model wants to use tools
+        iterations = 0
         while choice.finish_reason == "tool_calls":
+            iterations += 1
+            if iterations >= MAX_AGENT_ITERATIONS:
+                logger.warning("Agent hit max iterations (%d) for session %s", MAX_AGENT_ITERATIONS, session_id)
+                messages.append({"role": "assistant", "content": "I was unable to complete the determination within the allowed number of steps. Please try a more specific query."})
+                break
+
             assistant_msg = choice.message
             messages.append(assistant_msg.model_dump())
 
@@ -227,6 +255,7 @@ class MedicaidAgent:
                 except Exception as e:
                     result_text = f"Error: {e}"
 
+                result_text = self._sanitize_tool_result(result_text)
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tool_call.id,
@@ -242,16 +271,32 @@ class MedicaidAgent:
                 tools=openai_tools or None,
             )
             choice = response.choices[0]
+            if response.usage:
+                total_input_tokens += response.usage.prompt_tokens
+                total_output_tokens += response.usage.completion_tokens
+
+        elapsed_ms = round((time.monotonic() - start_time) * 1000)
 
         # Extract final text response
-        final_text = choice.message.content or ""
-        messages.append({"role": "assistant", "content": final_text})
+        if iterations < MAX_AGENT_ITERATIONS:
+            final_text = choice.message.content or ""
+            messages.append({"role": "assistant", "content": final_text})
+        else:
+            final_text = messages[-1].get("content", "") if messages else ""
+
         self.last_query_metrics = {
             "api_calls": api_calls,
             "tool_names": tool_names_used,
             "session_id": session_id,
+            "input_tokens": total_input_tokens,
+            "output_tokens": total_output_tokens,
+            "total_tokens": total_input_tokens + total_output_tokens,
+            "latency_ms": elapsed_ms,
         }
-        logger.info("Query completed: %d OpenAI API calls for session %s", api_calls, session_id)
+        logger.info(
+            "Query completed: %d API calls, %d tokens, %dms for session %s",
+            api_calls, total_input_tokens + total_output_tokens, elapsed_ms, session_id,
+        )
 
         # Save determination to Mem0 (SDK call, no GPT round-trip)
         if mem0 and final_text:
@@ -272,13 +317,41 @@ class MedicaidAgent:
         messages = self.conversations[session_id]
         messages.append({"role": "user", "content": query})
 
+        # Mem0 lookup (same as non-streaming)
+        mem0_context = ""
+        patient_id = self._extract_patient_id(session_id)
+        mem0_user = f"patient-{patient_id}" if patient_id else "medicaid-copilot"
+        if mem0:
+            try:
+                result = mem0.search(query, filters={"user_id": mem0_user})
+                memories = result.get("results", []) if isinstance(result, dict) else result
+                if memories:
+                    mem_texts = [m.get("memory", "") for m in memories[:3] if m.get("memory")]
+                    if mem_texts:
+                        mem0_context = "\n\n## PRIOR DETERMINATIONS FROM MEMORY\n" + "\n".join(f"- {t}" for t in mem_texts)
+            except Exception as e:
+                logger.warning("Mem0 search failed: %s", e)
+
+        system_prompt = SYSTEM_PROMPT + mem0_context
         openai_tools = _convert_tools(self.mcp.tools)
 
+        api_calls = 0
+        tool_names_used = []
+        start_time = time.monotonic()
+        iterations = 0
+
         while True:
+            iterations += 1
+            api_calls += 1
+            if iterations > MAX_AGENT_ITERATIONS:
+                logger.warning("Stream hit max iterations (%d) for session %s", MAX_AGENT_ITERATIONS, session_id)
+                yield "\n\nI was unable to complete the determination within the allowed number of steps."
+                break
+
             stream = self.client.chat.completions.create(
                 model=MODEL,
                 max_tokens=4096,
-                messages=[{"role": "system", "content": SYSTEM_PROMPT}] + messages,
+                messages=[{"role": "system", "content": system_prompt}] + messages,
                 tools=openai_tools or None,
                 stream=True,
             )
@@ -321,6 +394,12 @@ class MedicaidAgent:
             # If no tool calls, we're done
             if finish_reason != "tool_calls":
                 messages.append({"role": "assistant", "content": collected_content})
+                # Save Mem0 memory
+                if mem0 and collected_content:
+                    try:
+                        mem0.add(f"Query: {query}\nDetermination: {collected_content[:500]}", user_id=mem0_user)
+                    except Exception as e:
+                        logger.warning("Mem0 save failed: %s", e)
                 self.save_conversation(session_id, self._extract_patient_id(session_id))
                 break
 
@@ -346,6 +425,7 @@ class MedicaidAgent:
             for tc in tool_calls_list:
                 func_name = tc["function"]["name"]
                 func_args = json.loads(tc["function"]["arguments"])
+                tool_names_used.append(func_name)
                 try:
                     result = await self.mcp.call_tool(func_name, func_args)
                     result_text = ""
@@ -355,11 +435,24 @@ class MedicaidAgent:
                 except Exception as e:
                     result_text = f"Error: {e}"
 
+                result_text = self._sanitize_tool_result(result_text)
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc["id"],
                     "content": result_text,
                 })
+
+        elapsed_ms = round((time.monotonic() - start_time) * 1000)
+        self.last_query_metrics = {
+            "api_calls": api_calls,
+            "tool_names": tool_names_used,
+            "session_id": session_id,
+            "latency_ms": elapsed_ms,
+        }
+        logger.info(
+            "Stream completed: %d API calls, %dms for session %s",
+            api_calls, elapsed_ms, session_id,
+        )
 
     async def cleanup(self):
         """Shut down all MCP connections."""
