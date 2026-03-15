@@ -14,10 +14,13 @@ REPORTS_DIR.mkdir(exist_ok=True)
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://localhost:5432/medicaid")
 
+_NPX_ENV = {"NPM_CONFIG_LOGLEVEL": "silent", "NPM_CONFIG_FUND": "false", "NPM_CONFIG_AUDIT": "false"}
+
 SERVER_CONFIGS = {
     "postgres": StdioServerParameters(
         command="npx",
-        args=["-y", "--silent", "@modelcontextprotocol/server-postgres", DATABASE_URL],
+        args=["-y", "--loglevel=silent", "@modelcontextprotocol/server-postgres", DATABASE_URL],
+        env={**_NPX_ENV},
     ),
     "fetch": StdioServerParameters(
         command="python",
@@ -25,7 +28,8 @@ SERVER_CONFIGS = {
     ),
     "filesystem": StdioServerParameters(
         command="npx",
-        args=["-y", "--silent", "@modelcontextprotocol/server-filesystem", str(REPORTS_DIR)],
+        args=["-y", "--loglevel=silent", "@modelcontextprotocol/server-filesystem", str(REPORTS_DIR)],
+        env={**_NPX_ENV},
     ),
     "memory": StdioServerParameters(
         command="uvx",
