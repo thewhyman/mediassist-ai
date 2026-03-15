@@ -7,9 +7,11 @@ and the FastAPI server.
 import asyncio
 import json
 import logging
+import os
 from collections.abc import AsyncGenerator
 
 from dotenv import load_dotenv
+from mem0 import MemoryClient
 from openai import OpenAI
 
 from mcp_manager import MCPManager
@@ -18,6 +20,10 @@ from prompts import SYSTEM_PROMPT
 load_dotenv()
 
 logger = logging.getLogger(__name__)
+
+# Mem0 SDK client for storing/retrieving determination history
+_mem0_api_key = os.environ.get("MEM0_API_KEY", "")
+mem0 = MemoryClient(api_key=_mem0_api_key) if _mem0_api_key else None
 
 MODEL = "gpt-4o-mini"
 
@@ -169,13 +175,30 @@ class MedicaidAgent:
         messages = self.conversations[session_id]
         messages.append({"role": "user", "content": query})
 
+        # Search Mem0 for prior determinations scoped to this patient
+        mem0_context = ""
+        patient_id = self._extract_patient_id(session_id)
+        mem0_user = f"patient-{patient_id}" if patient_id else "medicaid-copilot"
+        if mem0:
+            try:
+                result = mem0.search(query, filters={"user_id": mem0_user})
+                memories = result.get("results", []) if isinstance(result, dict) else result
+                if memories:
+                    mem_texts = [m.get("memory", "") for m in memories[:3] if m.get("memory")]
+                    if mem_texts:
+                        mem0_context = "\n\n## PRIOR DETERMINATIONS FROM MEMORY\n" + "\n".join(f"- {t}" for t in mem_texts)
+                        logger.info("Mem0 returned %d memories for %s", len(mem_texts), mem0_user)
+            except Exception as e:
+                logger.warning("Mem0 search failed: %s", e)
+
+        system_prompt = SYSTEM_PROMPT + mem0_context
         openai_tools = _convert_tools(self.mcp.tools)
 
         api_calls = 1
         response = self.client.chat.completions.create(
             model=MODEL,
             max_tokens=4096,
-            messages=[{"role": "system", "content": SYSTEM_PROMPT}] + messages,
+            messages=[{"role": "system", "content": system_prompt}] + messages,
             tools=openai_tools or None,
         )
 
@@ -212,7 +235,7 @@ class MedicaidAgent:
             response = self.client.chat.completions.create(
                 model=MODEL,
                 max_tokens=4096,
-                messages=[{"role": "system", "content": SYSTEM_PROMPT}] + messages,
+                messages=[{"role": "system", "content": system_prompt}] + messages,
                 tools=openai_tools or None,
             )
             choice = response.choices[0]
@@ -221,6 +244,14 @@ class MedicaidAgent:
         final_text = choice.message.content or ""
         messages.append({"role": "assistant", "content": final_text})
         logger.info("Query completed: %d OpenAI API calls for session %s", api_calls, session_id)
+
+        # Save determination to Mem0 (SDK call, no GPT round-trip)
+        if mem0 and final_text:
+            try:
+                mem0.add(f"Query: {query}\nDetermination: {final_text[:500]}", user_id=mem0_user)
+                logger.info("Saved determination to Mem0")
+            except Exception as e:
+                logger.warning("Mem0 save failed: %s", e)
         self.save_conversation(session_id, self._extract_patient_id(session_id))
         return final_text
 
