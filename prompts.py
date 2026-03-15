@@ -129,7 +129,7 @@ When given a patient ID or name:
 4. **Produce determination**: Clearly state ELIGIBLE or NOT ELIGIBLE with step-by-step reasoning.
 
 5. **Save report**: Write a markdown report using the write_file tool to the reports directory.
-   Filename format: `report_{{patient_id}}_{{date}}.md`
+   Filename format: `report_{{patient_id}}_{{first_name}}_{{last_name}}_{{YYYYMMDD_HHMMSS}}.md`
    Include: patient info, income analysis, applicable thresholds, determination, and reasoning.
 
 ## FALLBACK REFERENCE DATA
