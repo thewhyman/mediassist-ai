@@ -8,8 +8,6 @@ Run with: python evals/test_eligibility.py
 """
 
 import asyncio
-import json
-import re
 import sys
 import os
 import time
@@ -17,7 +15,7 @@ import time
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from prompts import FPL, FPL_ALASKA, FPL_HAWAII, STATE_THRESHOLDS
+from eligibility import compute_eligibility, parse_determination
 
 # ---------------------------------------------------------------------------
 # Seed patients (mirrors seed_db.py)
@@ -123,102 +121,9 @@ PATIENTS = [
 ]
 
 
-def get_fpl(state: str, household_size: int) -> int:
-    """Get the FPL amount for a state and household size."""
-    if state == "AK":
-        return FPL_ALASKA.get(household_size, FPL_ALASKA[8])
-    elif state == "HI":
-        return FPL_HAWAII.get(household_size, FPL_HAWAII[8])
-    else:
-        return FPL.get(household_size, FPL[8])
-
-
-def determine_category(patient: dict) -> str:
-    """Determine which Medicaid eligibility category applies."""
-    if patient["age"] < 19:
-        return "child"
-    if patient["is_pregnant"]:
-        return "pregnant"
-    if patient["has_disability"]:
-        return "disabled"
-    if patient["age"] >= 65:
-        return "elderly"
-    return "adult"
-
-
 def compute_expected(patient: dict) -> dict:
-    """Compute expected eligibility using the same rules the agent should use."""
-    state = patient["state"]
-    hh_size = patient["household_size"]
-    income = patient["annual_income"]
-    category = determine_category(patient)
-
-    # Non-citizens are ineligible (simplified — real rules have qualified immigrant exceptions)
-    if not patient.get("is_us_citizen", True):
-        fpl = get_fpl(state, hh_size)
-        return {
-            "eligible": False,
-            "ambiguous": False,
-            "category": category,
-            "fpl": fpl,
-            "income_pct": round((income / fpl) * 100, 1),
-            "threshold_pct": 0,
-            "threshold_amount": 0,
-            "expansion": STATE_THRESHOLDS.get(state, {}).get("expansion", False),
-            "reason": "not a US citizen",
-        }
-
-    fpl = get_fpl(state, hh_size)
-    thresholds = STATE_THRESHOLDS.get(state)
-    if not thresholds:
-        return {"eligible": None, "category": category, "reason": "state not found"}
-
-    income_pct = (income / fpl) * 100
-
-    # Determine applicable threshold percentage
-    if category == "child":
-        threshold_pct = thresholds["child_pct"]
-    elif category == "pregnant":
-        threshold_pct = thresholds["pregnant_pct"]
-    elif category == "disabled":
-        # Disabled may qualify through SSI pathway — use adult threshold as baseline
-        # but note this is ambiguous (SSI has its own criteria)
-        threshold_pct = thresholds["adult_pct"]
-    elif category == "elderly":
-        # Elderly may qualify through aged/blind/disabled category
-        threshold_pct = thresholds["adult_pct"]
-    else:  # adult
-        threshold_pct = thresholds["adult_pct"]
-
-    threshold_amount = fpl * threshold_pct / 100
-    eligible = income <= threshold_amount
-
-    # Disabled/elderly in non-expansion states may qualify through SSI — mark ambiguous
-    ambiguous = category in ("disabled", "elderly") and not thresholds["expansion"]
-
-    return {
-        "eligible": eligible,
-        "ambiguous": ambiguous,
-        "category": category,
-        "fpl": fpl,
-        "income_pct": round(income_pct, 1),
-        "threshold_pct": threshold_pct,
-        "threshold_amount": round(threshold_amount, 2),
-        "expansion": thresholds["expansion"],
-    }
-
-
-def parse_determination(response: str) -> bool | None:
-    """Extract ELIGIBLE or NOT ELIGIBLE from agent response text."""
-    text = response.upper()
-    # Look for explicit "NOT ELIGIBLE" first (more specific)
-    if re.search(r'\bNOT\s+ELIGIBLE\b', text):
-        return False
-    if re.search(r'\bINELIGIBLE\b', text):
-        return False
-    if re.search(r'\bELIGIBLE\b', text):
-        return True
-    return None
+    """Compute expected eligibility using the shared deterministic engine."""
+    return compute_eligibility(patient)
 
 
 # ---------------------------------------------------------------------------
@@ -294,7 +199,7 @@ REQUIRED_KEYWORDS = {
     16: {"keyword_groups": [["adult"], ["138%", "138 %", "138 percent"]], "state_alts": ["HI", "hawaii"]},
 }
 
-MAX_API_CALLS = 3
+MAX_API_CALLS = 4  # 1 initial + 1 tool execution + 1 final response + 1 QA review
 BANNED_TOOLS = ["fetch"]
 
 

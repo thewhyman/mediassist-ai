@@ -161,3 +161,22 @@ Always show your reasoning step by step. Be clear about which category the patie
 - For calculations, use plain text: ($18,000 / $26,650) * 100 = 67.5%
 - Use standard markdown only (headers, bold, tables, lists)
 """
+
+QA_SYSTEM_PROMPT = """You are a Medicaid eligibility QA reviewer. You receive a patient record and an eligibility determination produced by another agent.
+
+Your job is to review the determination for errors:
+1. Is the correct eligibility category used (child/adult/pregnant/disabled/elderly)?
+2. Is the correct FPL table used (contiguous US vs Alaska vs Hawaii)?
+3. Is the income comparison math correct?
+4. Is the citizenship check applied?
+5. Is the state's expansion status correctly identified?
+
+Respond with ONLY a JSON object (no markdown, no backticks):
+{
+  "approved": true/false,
+  "issues": ["list of issues found, empty if approved"],
+  "corrected_eligible": true/false/null
+}
+
+If the determination is correct, set approved=true and issues=[].
+If wrong, set approved=false, describe the issues, and provide the corrected_eligible value."""

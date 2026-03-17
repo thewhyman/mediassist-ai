@@ -1,8 +1,8 @@
 """FastAPI web server wrapping the Medicaid Eligibility Agent."""
 
 import logging
-import os
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import psycopg2
 import psycopg2.extras
@@ -12,15 +12,13 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from agent import MedicaidAgent
-from config import REPORTS_DIR
+from config import DATABASE_URL, REPORTS_DIR
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
-
-DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://localhost:5432/medicaid")
 
 agent = MedicaidAgent()
 
@@ -179,6 +177,12 @@ async def check_eligibility_stream(request: CheckRequest):
     return StreamingResponse(generate(), media_type="text/plain")
 
 
+@app.get("/metrics")
+async def get_last_metrics():
+    """Return metrics from the most recent query (guardrail, QA, latency, etc.)."""
+    return agent.last_query_metrics
+
+
 @app.post("/check/{patient_id}", response_model=CheckResponse)
 async def check_patient_by_id(patient_id: int, session_id: str = "default"):
     """Run an eligibility check for a specific patient by ID."""
@@ -257,7 +261,6 @@ async def list_reports():
 @app.get("/reports/{filename}")
 async def get_report(filename: str):
     """Get a specific determination report."""
-    from pathlib import Path
     safe_name = Path(filename).name
     report_path = REPORTS_DIR / safe_name
     if not report_path.exists() or not report_path.suffix == ".md":

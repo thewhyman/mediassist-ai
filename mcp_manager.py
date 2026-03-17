@@ -12,11 +12,9 @@ from typing import Any
 from mcp import ClientSession
 from mcp.client.stdio import stdio_client
 
-from config import SERVER_CONFIGS
+from config import MAX_MCP_RETRIES, SERVER_CONFIGS
 
 logger = logging.getLogger(__name__)
-
-MAX_RETRIES = 2
 
 
 class MCPManager:
@@ -85,7 +83,7 @@ class MCPManager:
         if not session_name:
             raise ValueError(f"Unknown tool: {tool_name}")
 
-        for attempt in range(1, MAX_RETRIES + 1):
+        for attempt in range(1, MAX_MCP_RETRIES + 1):
             session = self.sessions.get(session_name)
             if not session:
                 if not await self._reconnect_server(session_name):
@@ -97,12 +95,12 @@ class MCPManager:
             try:
                 return await session.call_tool(tool_name, arguments)
             except Exception as e:
-                if attempt < MAX_RETRIES:
+                if attempt < MAX_MCP_RETRIES:
                     logger.warning(
                         "Tool call '%s' failed (attempt %d/%d): %s — reconnecting...",
                         tool_name,
                         attempt,
-                        MAX_RETRIES,
+                        MAX_MCP_RETRIES,
                         e,
                     )
                     self.sessions.pop(session_name, None)

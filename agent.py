@@ -8,6 +8,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from collections.abc import AsyncGenerator
 
@@ -15,8 +16,14 @@ from dotenv import load_dotenv
 from mem0 import MemoryClient
 from openai import OpenAI
 
+from config import MAX_AGENT_ITERATIONS, MAX_TOOL_RESULT_LENGTH, MODEL
+from eligibility import (
+    compute_eligibility,
+    format_determination_summary,
+    parse_determination,
+)
 from mcp_manager import MCPManager
-from prompts import SYSTEM_PROMPT
+from prompts import QA_SYSTEM_PROMPT, SYSTEM_PROMPT
 
 load_dotenv()
 
@@ -25,10 +32,6 @@ logger = logging.getLogger(__name__)
 # Mem0 SDK client for storing/retrieving determination history
 _mem0_api_key = os.environ.get("MEM0_API_KEY", "")
 mem0 = MemoryClient(api_key=_mem0_api_key) if _mem0_api_key else None
-
-MODEL = "gpt-4o-mini"
-MAX_AGENT_ITERATIONS = 10
-MAX_TOOL_RESULT_LENGTH = 10000
 
 
 def _convert_tools(mcp_tools: list[dict]) -> list[dict]:
@@ -168,6 +171,218 @@ class MedicaidAgent:
             saved = self.load_conversation(session_id)
             self.conversations[session_id] = saved if saved else []
 
+    def _extract_patient_record(self, messages: list) -> dict | None:
+        """Extract patient record from tool call results in the conversation.
+
+        Looks for a JSON-like patient record returned by the Postgres MCP
+        tool call. Returns parsed dict or None.
+        """
+        for msg in messages:
+            content = msg.get("content", "") if isinstance(msg, dict) else ""
+            if msg.get("role") != "tool" or not content:
+                continue
+            # Look for patient-like data with key fields
+            if "annual_income" in content and "state" in content:
+                # Try to parse as JSON array (MCP postgres returns rows)
+                try:
+                    rows = json.loads(content)
+                    if isinstance(rows, list) and rows:
+                        return rows[0]
+                    if isinstance(rows, dict):
+                        return rows
+                except (json.JSONDecodeError, TypeError):
+                    pass
+                # Try to find JSON object in the text
+                match = re.search(r'\{[^{}]*"annual_income"[^{}]*\}', content)
+                if match:
+                    try:
+                        return json.loads(match.group())
+                    except json.JSONDecodeError:
+                        pass
+        return None
+
+    def _run_guardrail(self, patient: dict, llm_text: str) -> dict:
+        """Layer 4 guardrail: compare LLM determination against deterministic engine.
+
+        Returns dict with keys:
+          - match (bool): whether LLM and engine agree
+          - engine_result (dict): deterministic eligibility result
+          - engine_summary (str): formatted summary
+          - llm_eligible (bool|None): what the LLM said
+        """
+        engine_result = compute_eligibility(patient)
+        engine_summary = format_determination_summary(patient, engine_result)
+        llm_eligible = parse_determination(llm_text)
+
+        # If ambiguous (disabled/elderly in non-expansion), accept either answer
+        if engine_result["ambiguous"]:
+            return {
+                "match": True,
+                "engine_result": engine_result,
+                "engine_summary": engine_summary,
+                "llm_eligible": llm_eligible,
+            }
+
+        match = llm_eligible == engine_result["eligible"]
+        if not match:
+            logger.warning(
+                "GUARDRAIL MISMATCH: LLM said %s, engine says %s for patient %s %s",
+                llm_eligible,
+                engine_result["eligible"],
+                patient.get("first_name", "?"),
+                patient.get("last_name", "?"),
+            )
+
+        return {
+            "match": match,
+            "engine_result": engine_result,
+            "engine_summary": engine_summary,
+            "llm_eligible": llm_eligible,
+        }
+
+    def _run_qa_review(self, patient: dict, determination: str, engine_result: dict) -> dict | None:
+        """QA agent: second LLM pass reviewing the determination for errors.
+
+        Uses the deterministic engine result as ground truth context.
+        Returns parsed QA response or None on failure.
+        """
+        engine_summary = format_determination_summary(patient, engine_result)
+        try:
+            response = self.client.chat.completions.create(
+                model=MODEL,
+                max_tokens=512,
+                messages=[
+                    {"role": "system", "content": QA_SYSTEM_PROMPT},
+                    {"role": "user", "content": (
+                        f"## Patient Record\n{json.dumps(patient, default=str)}\n\n"
+                        f"## Deterministic Engine Result\n{engine_summary}\n\n"
+                        f"## Agent Determination\n{determination[:2000]}"
+                    )},
+                ],
+            )
+            qa_text = response.choices[0].message.content or ""
+            # Strip markdown code fences if present
+            qa_text = qa_text.strip()
+            if qa_text.startswith("```"):
+                qa_text = qa_text.split("\n", 1)[-1]
+            if qa_text.endswith("```"):
+                qa_text = qa_text.rsplit("```", 1)[0]
+            qa_result = json.loads(qa_text.strip())
+            logger.info("QA review: approved=%s issues=%s", qa_result.get("approved"), qa_result.get("issues"))
+            return qa_result
+        except Exception as e:
+            logger.warning("QA review failed: %s", e)
+            return None
+
+    def _get_mem0_context(self, query: str, session_id: str) -> tuple[str, str]:
+        """Search Mem0 for prior determinations. Returns (mem0_context, mem0_user)."""
+        patient_id = self._extract_patient_id(session_id)
+        mem0_user = f"patient-{patient_id}" if patient_id else "medicaid-copilot"
+        if not mem0:
+            return "", mem0_user
+        try:
+            result = mem0.search(query, filters={"user_id": mem0_user})
+            memories = result.get("results", []) if isinstance(result, dict) else result
+            if memories:
+                mem_texts = [m.get("memory", "") for m in memories[:3] if m.get("memory")]
+                if mem_texts:
+                    context = "\n\n## PRIOR DETERMINATIONS FROM MEMORY\n" + "\n".join(f"- {t}" for t in mem_texts)
+                    logger.info("Mem0 returned %d memories for %s", len(mem_texts), mem0_user)
+                    return context, mem0_user
+        except Exception as e:
+            logger.warning("Mem0 search failed: %s", e)
+        return "", mem0_user
+
+    def _save_mem0(self, query: str, determination: str, mem0_user: str):
+        """Save determination to Mem0."""
+        if mem0 and determination:
+            try:
+                mem0.add(f"Query: {query}\nDetermination: {determination[:500]}", user_id=mem0_user)
+                logger.info("Saved determination to Mem0")
+            except Exception as e:
+                logger.warning("Mem0 save failed: %s", e)
+
+    def _apply_guardrail_and_qa(
+        self, messages: list, determination: str, api_calls: int
+    ) -> tuple[str, dict | None, dict | None, int]:
+        """Run guardrail check and QA review on a determination.
+
+        Returns (possibly_corrected_text, guardrail_result, qa_result, updated_api_calls).
+        """
+        patient_record = self._extract_patient_record(messages)
+        if not patient_record or not determination:
+            return determination, None, None, api_calls
+
+        guardrail_result = self._run_guardrail(patient_record, determination)
+
+        if not guardrail_result["match"]:
+            correction = (
+                f"\n\n---\n**Guardrail Correction**: The deterministic eligibility engine "
+                f"produced a different result than the initial assessment.\n\n"
+                f"{guardrail_result['engine_summary']}\n\n"
+                f"The corrected determination has been applied."
+            )
+            determination += correction
+            messages.append({"role": "assistant", "content": correction})
+            logger.info("Guardrail correction appended to response")
+
+        qa_result = self._run_qa_review(
+            patient_record, determination, guardrail_result["engine_result"]
+        )
+        api_calls += 1
+
+        return determination, guardrail_result, qa_result, api_calls
+
+    def _build_metrics(
+        self,
+        api_calls: int,
+        tool_names: list[str],
+        session_id: str,
+        elapsed_ms: int,
+        guardrail_result: dict | None,
+        qa_result: dict | None,
+        messages: list,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+    ) -> dict:
+        """Build the metrics dict used by the UI and evals."""
+        patient_record = self._extract_patient_record(messages)
+        skipped_reason = None
+        if not patient_record:
+            skipped_reason = (
+                "No patient record found in tool results — likely a Mem0 cached "
+                "response or follow-up question. Guardrail and QA require a fresh DB query."
+            )
+
+        metrics = {
+            "api_calls": api_calls,
+            "tool_names": tool_names,
+            "session_id": session_id,
+            "latency_ms": elapsed_ms,
+            "guardrail_match": guardrail_result["match"] if guardrail_result else None,
+            "guardrail_details": {
+                "engine_eligible": guardrail_result["engine_result"]["eligible"],
+                "llm_eligible": guardrail_result["llm_eligible"],
+                "category": guardrail_result["engine_result"]["category"],
+                "income_pct": guardrail_result["engine_result"]["income_pct"],
+                "threshold_pct": guardrail_result["engine_result"]["threshold_pct"],
+                "threshold_amount": guardrail_result["engine_result"]["threshold_amount"],
+                "fpl": guardrail_result["engine_result"]["fpl"],
+                "expansion": guardrail_result["engine_result"]["expansion"],
+                "reason": guardrail_result["engine_result"].get("reason", ""),
+            } if guardrail_result else None,
+            "qa_approved": qa_result.get("approved") if qa_result else None,
+            "qa_issues": qa_result.get("issues") if qa_result else None,
+            "qa_corrected_eligible": qa_result.get("corrected_eligible") if qa_result else None,
+            "skipped_reason": skipped_reason,
+        }
+        if input_tokens or output_tokens:
+            metrics["input_tokens"] = input_tokens
+            metrics["output_tokens"] = output_tokens
+            metrics["total_tokens"] = input_tokens + output_tokens
+
+        return metrics
+
     @staticmethod
     def _sanitize_tool_result(result_text: str) -> str:
         """Truncate oversized tool results and strip control characters."""
@@ -190,22 +405,7 @@ class MedicaidAgent:
         messages = self.conversations[session_id]
         messages.append({"role": "user", "content": query})
 
-        # Search Mem0 for prior determinations scoped to this patient
-        mem0_context = ""
-        patient_id = self._extract_patient_id(session_id)
-        mem0_user = f"patient-{patient_id}" if patient_id else "medicaid-copilot"
-        if mem0:
-            try:
-                result = mem0.search(query, filters={"user_id": mem0_user})
-                memories = result.get("results", []) if isinstance(result, dict) else result
-                if memories:
-                    mem_texts = [m.get("memory", "") for m in memories[:3] if m.get("memory")]
-                    if mem_texts:
-                        mem0_context = "\n\n## PRIOR DETERMINATIONS FROM MEMORY\n" + "\n".join(f"- {t}" for t in mem_texts)
-                        logger.info("Mem0 returned %d memories for %s", len(mem_texts), mem0_user)
-            except Exception as e:
-                logger.warning("Mem0 search failed: %s", e)
-
+        mem0_context, mem0_user = self._get_mem0_context(query, session_id)
         system_prompt = SYSTEM_PROMPT + mem0_context
         openai_tools = _convert_tools(self.mcp.tools)
 
@@ -239,7 +439,6 @@ class MedicaidAgent:
             assistant_msg = choice.message
             messages.append(assistant_msg.model_dump())
 
-            # Process all tool calls in this response
             for tool_call in assistant_msg.tool_calls:
                 func_name = tool_call.function.name
                 func_args = json.loads(tool_call.function.arguments)
@@ -262,7 +461,6 @@ class MedicaidAgent:
                     "content": result_text,
                 })
 
-            # Next iteration
             api_calls += 1
             response = self.client.chat.completions.create(
                 model=MODEL,
@@ -275,8 +473,6 @@ class MedicaidAgent:
                 total_input_tokens += response.usage.prompt_tokens
                 total_output_tokens += response.usage.completion_tokens
 
-        elapsed_ms = round((time.monotonic() - start_time) * 1000)
-
         # Extract final text response
         if iterations < MAX_AGENT_ITERATIONS:
             final_text = choice.message.content or ""
@@ -284,27 +480,26 @@ class MedicaidAgent:
         else:
             final_text = messages[-1].get("content", "") if messages else ""
 
-        self.last_query_metrics = {
-            "api_calls": api_calls,
-            "tool_names": tool_names_used,
-            "session_id": session_id,
-            "input_tokens": total_input_tokens,
-            "output_tokens": total_output_tokens,
-            "total_tokens": total_input_tokens + total_output_tokens,
-            "latency_ms": elapsed_ms,
-        }
-        logger.info(
-            "Query completed: %d API calls, %d tokens, %dms for session %s",
-            api_calls, total_input_tokens + total_output_tokens, elapsed_ms, session_id,
+        # Layer 4 Guardrail + QA Agent
+        final_text, guardrail_result, qa_result, api_calls = self._apply_guardrail_and_qa(
+            messages, final_text, api_calls
         )
 
-        # Save determination to Mem0 (SDK call, no GPT round-trip)
-        if mem0 and final_text:
-            try:
-                mem0.add(f"Query: {query}\nDetermination: {final_text[:500]}", user_id=mem0_user)
-                logger.info("Saved determination to Mem0")
-            except Exception as e:
-                logger.warning("Mem0 save failed: %s", e)
+        elapsed_ms = round((time.monotonic() - start_time) * 1000)
+        self.last_query_metrics = self._build_metrics(
+            api_calls, tool_names_used, session_id, elapsed_ms,
+            guardrail_result, qa_result, messages,
+            total_input_tokens, total_output_tokens,
+        )
+        logger.info(
+            "Query completed: %d API calls, %d tokens, %dms, guardrail=%s, qa=%s for session %s",
+            api_calls, total_input_tokens + total_output_tokens, elapsed_ms,
+            guardrail_result["match"] if guardrail_result else "skipped",
+            qa_result.get("approved") if qa_result else "skipped",
+            session_id,
+        )
+
+        self._save_mem0(query, final_text, mem0_user)
         self.save_conversation(session_id, self._extract_patient_id(session_id))
         return final_text
 
@@ -317,21 +512,7 @@ class MedicaidAgent:
         messages = self.conversations[session_id]
         messages.append({"role": "user", "content": query})
 
-        # Mem0 lookup (same as non-streaming)
-        mem0_context = ""
-        patient_id = self._extract_patient_id(session_id)
-        mem0_user = f"patient-{patient_id}" if patient_id else "medicaid-copilot"
-        if mem0:
-            try:
-                result = mem0.search(query, filters={"user_id": mem0_user})
-                memories = result.get("results", []) if isinstance(result, dict) else result
-                if memories:
-                    mem_texts = [m.get("memory", "") for m in memories[:3] if m.get("memory")]
-                    if mem_texts:
-                        mem0_context = "\n\n## PRIOR DETERMINATIONS FROM MEMORY\n" + "\n".join(f"- {t}" for t in mem_texts)
-            except Exception as e:
-                logger.warning("Mem0 search failed: %s", e)
-
+        mem0_context, mem0_user = self._get_mem0_context(query, session_id)
         system_prompt = SYSTEM_PROMPT + mem0_context
         openai_tools = _convert_tools(self.mcp.tools)
 
@@ -391,15 +572,24 @@ class MedicaidAgent:
                             if tc_delta.function.arguments:
                                 collected_tool_calls[idx]["arguments"] += tc_delta.function.arguments
 
-            # If no tool calls, we're done
+            # If no tool calls, we're done — run guardrail + QA before finishing
             if finish_reason != "tool_calls":
                 messages.append({"role": "assistant", "content": collected_content})
-                # Save Mem0 memory
-                if mem0 and collected_content:
-                    try:
-                        mem0.add(f"Query: {query}\nDetermination: {collected_content[:500]}", user_id=mem0_user)
-                    except Exception as e:
-                        logger.warning("Mem0 save failed: %s", e)
+
+                collected_content, guardrail_result, qa_result, api_calls = (
+                    self._apply_guardrail_and_qa(messages, collected_content, api_calls)
+                )
+                # Stream guardrail correction if one was appended
+                if guardrail_result and not guardrail_result["match"]:
+                    # The correction text is the last assistant message added by _apply_guardrail_and_qa
+                    correction = messages[-1].get("content", "")
+                    if correction:
+                        yield correction
+
+                self._last_guardrail = guardrail_result
+                self._last_qa = qa_result
+
+                self._save_mem0(query, collected_content, mem0_user)
                 self.save_conversation(session_id, self._extract_patient_id(session_id))
                 break
 
@@ -443,15 +633,19 @@ class MedicaidAgent:
                 })
 
         elapsed_ms = round((time.monotonic() - start_time) * 1000)
-        self.last_query_metrics = {
-            "api_calls": api_calls,
-            "tool_names": tool_names_used,
-            "session_id": session_id,
-            "latency_ms": elapsed_ms,
-        }
+        guardrail_result = getattr(self, "_last_guardrail", None)
+        qa_result = getattr(self, "_last_qa", None)
+
+        self.last_query_metrics = self._build_metrics(
+            api_calls, tool_names_used, session_id, elapsed_ms,
+            guardrail_result, qa_result, messages,
+        )
         logger.info(
-            "Stream completed: %d API calls, %dms for session %s",
-            api_calls, elapsed_ms, session_id,
+            "Stream completed: %d API calls, %dms, guardrail=%s, qa=%s for session %s",
+            api_calls, elapsed_ms,
+            guardrail_result["match"] if guardrail_result else "skipped",
+            qa_result.get("approved") if qa_result else "skipped",
+            session_id,
         )
 
     async def cleanup(self):

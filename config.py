@@ -18,6 +18,17 @@ REPORTS_DIR.mkdir(exist_ok=True)
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://localhost:5432/medicaid")
 
+# Pin to a specific model snapshot to prevent silent model drift.
+# Update deliberately after running regression evals on the new version.
+MODEL = "gpt-4o-mini-2024-07-18"
+
+# Agent loop guardrails
+MAX_AGENT_ITERATIONS = 10
+MAX_TOOL_RESULT_LENGTH = 10000
+
+# MCP connection retry limit
+MAX_MCP_RETRIES = 2
+
 
 def _find_npm_package(package_name: str) -> str | None:
     """Find the JS entry point of a locally-installed npm MCP server package.
